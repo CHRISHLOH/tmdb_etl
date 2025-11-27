@@ -10,8 +10,9 @@ ETL Orchestrator
 
 Usage:
     python run_etl.py --stage dictionaries
-    python run_etl.py --stage movies --target-count 1000
-    python run_etl.py --stage series --target-count 500
+    python run_etl.py --stage movies --target-count 1000 --min-popularity 20
+    python run_etl.py --stage series --target-count 500 --min-vote-count 200
+    python run_etl.py --stage series --target-count 100 --load-episodes --min-vote-count 500
     python run_etl.py --stage all
 """
 
@@ -106,6 +107,7 @@ class ETLOrchestrator:
         strategy: str = "discover",
         target_count: int = 500,
         load_episodes: bool = False,
+        min_vote_count: int = 100,
         **strategy_kwargs
     ):
         """
@@ -115,12 +117,14 @@ class ETLOrchestrator:
             strategy: "discover"
             target_count: Количество сериалов
             load_episodes: Загружать ли эпизоды (МЕДЛЕННО, для MVP = False)
-            **strategy_kwargs: Параметры для стратегии
+            min_vote_count: Минимум голосов для фильтрации
+            **strategy_kwargs: Дополнительные параметры для стратегии
         """
         print("\n" + "="*70)
         print(f"STAGE 3: SERIES")
         print(f"Strategy: {strategy}")
         print(f"Target: {target_count} series")
+        print(f"Min vote count: {min_vote_count}")
         print(f"Load episodes: {load_episodes}")
         print("="*70)
         
@@ -134,6 +138,7 @@ class ETLOrchestrator:
                 strategy=strategy,
                 target_count=target_count,
                 load_episodes=load_episodes,
+                min_vote_count=min_vote_count,
                 **strategy_kwargs
             ).run()
         )
@@ -148,7 +153,13 @@ class ETLOrchestrator:
         print("⚠️  PersonLoader not implemented yet")
         return True
     
-    def run_all(self, target_count: int = 1000, min_popularity: float = 20):
+    def run_all(
+        self, 
+        movies_count: int = 1000, 
+        min_popularity: float = 20,
+        series_count: int = 500,
+        min_vote_count: int = 100
+    ):
         """Запуск всех этапов последовательно"""
         self.start_time = time.time()
         
@@ -164,12 +175,16 @@ class ETLOrchestrator:
             return False
         
         # Этап 2: Фильмы
-        if not self.run_movies(target_count=target_count, min_popularity=min_popularity):
+        if not self.run_movies(target_count=movies_count, min_popularity=min_popularity):
             print("\n⚠️  Movies stage failed, but continuing...")
         
-        # Этап 3: Сериалы (опционально)
-        # if not self.run_series(target_count=500, load_episodes=False):
-        #     print("\n⚠️  Series stage failed, but continuing...")
+        # Этап 3: Сериалы
+        if not self.run_series(
+            target_count=series_count, 
+            load_episodes=False,
+            min_vote_count=min_vote_count
+        ):
+            print("\n⚠️  Series stage failed, but continuing...")
         
         # Этап 4: Персоны
         # if not self.run_persons():
@@ -200,25 +215,59 @@ class ETLOrchestrator:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TMDB ETL Orchestrator")
+    parser = argparse.ArgumentParser(
+        description="TMDB ETL Orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Загрузить справочники
+  python run_etl.py --stage dictionaries
+  
+  # Загрузить топ-1000 фильмов
+  python run_etl.py --stage movies --target-count 1000 --min-popularity 20
+  
+  # Загрузить топ-500 сериалов БЕЗ эпизодов (быстро)
+  python run_etl.py --stage series --target-count 500 --min-vote-count 200
+  
+  # Загрузить топ-100 сериалов С эпизодами (медленно)
+  python run_etl.py --stage series --target-count 100 --load-episodes --min-vote-count 500
+  
+  # Запустить весь pipeline
+  python run_etl.py --stage all --target-count 1000 --min-popularity 20
+        """
+    )
+    
     parser.add_argument(
         "--stage",
         choices=["all", "dictionaries", "movies", "series", "persons"],
         default="all",
         help="Which stage to run"
     )
+    
+    # Общие параметры
     parser.add_argument(
         "--target-count",
         type=int,
         default=1000,
-        help="Target number of items to load (movies or series)"
+        help="Target number of items for movies (used with --stage movies or --stage all)"
     )
+    
+    # Параметры для фильмов
     parser.add_argument(
         "--min-popularity",
         type=float,
         default=20.0,
-        help="Minimum popularity threshold for movies"
+        help="Minimum popularity threshold for movies (used with --stage movies)"
     )
+    
+    # Параметры для сериалов
+    parser.add_argument(
+        "--min-vote-count",
+        type=int,
+        default=100,
+        help="Minimum vote count for series quality filtering (used with --stage series)"
+    )
+    
     parser.add_argument(
         "--load-episodes",
         action="store_true",
@@ -231,8 +280,10 @@ def main():
     
     if args.stage == "all":
         success = orchestrator.run_all(
-            target_count=args.target_count,
-            min_popularity=args.min_popularity
+            movies_count=args.target_count,
+            min_popularity=args.min_popularity,
+            series_count=args.target_count,  # Используем тот же target_count
+            min_vote_count=args.min_vote_count
         )
     elif args.stage == "dictionaries":
         success = orchestrator.run_dictionaries()
@@ -246,7 +297,7 @@ def main():
             strategy="discover",
             target_count=args.target_count,
             load_episodes=args.load_episodes,
-            min_vote_count=200
+            min_vote_count=args.min_vote_count
         )
     elif args.stage == "persons":
         success = orchestrator.run_persons(max_persons=1000)

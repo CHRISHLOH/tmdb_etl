@@ -1,5 +1,5 @@
 """
-Стратегия загрузки сериалов через TMDB /discover/tv API.
+Стратегия загрузки сериалов через TMDB /discover/tv API (ИСПРАВЛЕНО)
 
 КРИТИЧЕСКИЕ ОТЛИЧИЯ ОТ ФИЛЬМОВ:
 1. Сериал = content + series_details + seasons + episodes
@@ -12,10 +12,6 @@
 - Уровень 3: Для каждого сезона получить эпизоды (ОПЦИОНАЛЬНО для MVP)
 
 ДЛЯ MVP: грузим только сериалы + сезоны, эпизоды позже
-"""
-
-"""
-Исправленная стратегия загрузки сериалов
 """
 
 import asyncio
@@ -39,6 +35,14 @@ class SeriesDiscoverStrategy:
         min_vote_count: int = 100,
         load_episodes: bool = False
     ):
+        """
+        Args:
+            client: AsyncTMDBClient instance
+            target_count: Количество сериалов
+            sort_by: Сортировка (popularity.desc, vote_average.desc)
+            min_vote_count: Минимум голосов для качества
+            load_episodes: Загружать ли эпизоды (МЕДЛЕННО)
+        """
         self.client = client
         self.target_count = target_count
         self.sort_by = sort_by
@@ -49,8 +53,10 @@ class SeriesDiscoverStrategy:
         self.results_per_page = 20
     
     async def get_series_ids(self) -> List[int]:
-        """Получить список ID сериалов"""
+        """Получить список ID сериалов через /discover/tv"""
         print(f"📥 Discovering series (target: {self.target_count})...")
+        print(f"   Sort: {self.sort_by}")
+        print(f"   Min votes: {self.min_vote_count}\n")
         
         series_ids = []
         pages_needed = min(
@@ -64,6 +70,7 @@ class SeriesDiscoverStrategy:
             for page in range(1, pages_needed + 1):
                 tasks.append(self._fetch_discover_page(session, page))
                 
+                # Батчи по 50 страниц для контроля
                 if len(tasks) >= 50 or page == pages_needed:
                     results = await asyncio.gather(*tasks)
                     
@@ -72,13 +79,13 @@ class SeriesDiscoverStrategy:
                             series_ids.extend([s["id"] for s in page_data.get("results", [])])
                     
                     tasks = []
-                    print(f"  Progress: {page}/{pages_needed} pages, {len(series_ids)} series")
+                    print(f"  Progress: {page}/{pages_needed} pages, {len(series_ids)} series found")
                     
                     if len(series_ids) >= self.target_count:
                         break
         
         series_ids = series_ids[:self.target_count]
-        print(f"✅ Discovered {len(series_ids)} series IDs")
+        print(f"✅ Discovered {len(series_ids)} series IDs\n")
         return series_ids
     
     async def _fetch_discover_page(
@@ -86,34 +93,46 @@ class SeriesDiscoverStrategy:
         session: aiohttp.ClientSession, 
         page: int
     ) -> Optional[Dict]:
-        """Получить одну страницу"""
+        """Получить одну страницу discover results"""
         params = {
             "page": page,
             "sort_by": self.sort_by,
             "vote_count.gte": self.min_vote_count,
-            "include_adult": "false"  # ВАЖНО: строка, не bool
+            "include_adult": "false"  # ВАЖНО: строка, не bool!
         }
         
         return await self.client._request(session, "/discover/tv", params)
     
     async def fetch_series_full_data(self, series_ids: List[int]) -> List[Dict]:
-        """Загрузить полные данные сериалов"""
-        print(f"\n📥 Fetching full data for {len(series_ids)} series...")
+        """
+        Загрузить полные данные сериалов.
+        
+        Для каждого сериала получаем:
+        1. Базовые детали + translations
+        2. Список сезонов (из базового API response)
+        3. Опционально: детали каждого эпизода (МЕДЛЕННО)
+        """
+        print(f"📥 Fetching full data for {len(series_ids)} series...")
         
         if self.load_episodes:
             print("⚠️  WARNING: load_episodes=True will be VERY SLOW")
+            print(f"   Estimated time: {len(series_ids) * 5 * 0.02:.1f} minutes (assuming 5 seasons avg)\n")
         
         async with aiohttp.ClientSession(headers=self.client.headers) as session:
+            # Загружаем базовые детали сериалов параллельно
             tasks = [
                 self._fetch_series_with_seasons(session, series_id)
                 for series_id in series_ids
             ]
             
             results = await tqdm_asyncio.gather(*tasks, desc="Fetching series")
+            
+            # Фильтруем None
             series_data = [r for r in results if r is not None]
             
             print(f"✅ Fetched {len(series_data)} series (with seasons)")
             
+            # Если нужны эпизоды - загружаем их отдельно
             if self.load_episodes:
                 await self._fetch_all_episodes(session, series_data)
             
@@ -124,7 +143,12 @@ class SeriesDiscoverStrategy:
         session: aiohttp.ClientSession, 
         series_id: int
     ) -> Optional[Dict]:
-        """Получить сериал + сезоны"""
+        """
+        Получить сериал + его сезоны (БЕЗ эпизодов).
+        
+        TMDB API: /tv/{id}?append_to_response=translations
+        Сезоны включены в базовый response.
+        """
         data = await self.client._request(
             session,
             f"/tv/{series_id}",
@@ -137,7 +161,8 @@ class SeriesDiscoverStrategy:
         if not data:
             return None
         
-        # Инициализируем пустой список эпизодов
+        # Добавляем пустой список эпизодов для каждого сезона
+        # (заполним позже если load_episodes=True)
         for season in data.get("seasons", []):
             season["episodes"] = []
         
@@ -148,19 +173,24 @@ class SeriesDiscoverStrategy:
         session: aiohttp.ClientSession, 
         series_data: List[Dict]
     ):
-        """Загрузить все эпизоды (МЕДЛЕННО)"""
+        """
+        МЕДЛЕННАЯ ОПЕРАЦИЯ: загрузить все эпизоды всех сезонов.
+        
+        Используй только для небольшого числа сериалов или после MVP.
+        """
         print(f"\n📥 Fetching episodes for all seasons...")
         
-        # Собираем все сезоны
+        # Собираем все (series_id, season_number) пары
         season_tasks = []
         for series in series_data:
             series_id = series["id"]
             for season in series.get("seasons", []):
                 season_number = season["season_number"]
-                if season_number > 0:  # Пропускаем specials
+                # Пропускаем "Specials" (season 0)
+                if season_number > 0:
                     season_tasks.append((series_id, season_number, season))
         
-        print(f"  Total seasons: {len(season_tasks)}")
+        print(f"  Total seasons to fetch: {len(season_tasks)}")
         
         # Загружаем батчами
         batch_size = 100
@@ -168,17 +198,17 @@ class SeriesDiscoverStrategy:
             batch = season_tasks[i:i + batch_size]
             
             tasks = [
-                self._fetch_season_episodes(session, sid, snum)
-                for sid, snum, _ in batch
+                self._fetch_season_episodes(session, series_id, season_num)
+                for series_id, season_num, _ in batch
             ]
             
             results = await tqdm_asyncio.gather(
                 *tasks, 
-                desc=f"Batch {i//batch_size + 1}"
+                desc=f"Fetching episodes batch {i//batch_size + 1}"
             )
             
-            # Записываем результаты
-            for (_, _, season_obj), episodes in zip(batch, results):
+            # Записываем эпизоды обратно в структуру данных
+            for (series_id, season_num, season_obj), episodes in zip(batch, results):
                 if episodes:
                     season_obj["episodes"] = episodes
     
@@ -188,24 +218,57 @@ class SeriesDiscoverStrategy:
         series_id: int,
         season_number: int
     ) -> List[Dict]:
-        """Получить эпизоды сезона"""
+        """
+        Получить все эпизоды сезона.
+        
+        TMDB API: /tv/{series_id}/season/{season_number}
+        """
         data = await self.client._request(
             session,
             f"/tv/{series_id}/season/{season_number}",
             params={"language": "en"}
         )
         
-        return data.get("episodes", []) if data else []
+        if not data:
+            return []
+        
+        return data.get("episodes", [])
     
     def estimate_time(self) -> str:
-        """Оценка времени"""
-        discover_time = (self.target_count / 20) / 45
-        series_time = self.target_count / 45
+        """Оценка времени загрузки"""
+        # Discover: ~1 req на 20 сериалов
+        discover_time = (self.target_count / 20) / 45  # seconds
         
+        # Series details: 1 req на сериал
+        series_time = self.target_count / 45  # seconds
+        
+        # Episodes: если включено
         episodes_time = 0
         if self.load_episodes:
-            avg_seasons = 5
-            episodes_time = (self.target_count * avg_seasons) / 45
+            avg_seasons = 5  # среднее количество сезонов
+            episodes_time = (self.target_count * avg_seasons) / 45  # seconds
         
         total_minutes = (discover_time + series_time + episodes_time) / 60
+        
         return f"{total_minutes:.1f} minutes"
+
+
+if __name__ == "__main__":
+    # Тест оценки времени
+    from tmdb_client import AsyncTMDBClient
+    
+    client = AsyncTMDBClient()
+    
+    strategy = SeriesDiscoverStrategy(
+        client=client,
+        target_count=5000,
+        load_episodes=False
+    )
+    print(f"Estimated time (5000 series, no episodes): {strategy.estimate_time()}")
+    
+    strategy_with_episodes = SeriesDiscoverStrategy(
+        client=client,
+        target_count=1000,
+        load_episodes=True
+    )
+    print(f"Estimated time (1000 series, with episodes): {strategy_with_episodes.estimate_time()}")
