@@ -17,7 +17,9 @@
 import asyncio
 from typing import List, Dict, Optional
 from datetime import datetime
-
+import aiohttp
+from typing import List, Dict, Optional
+import asyncio
 
 class SeriesDiscoverStrategy:
     """
@@ -94,11 +96,11 @@ class SeriesDiscoverStrategy:
     async def _fetch_discover_page(self, session: aiohttp.ClientSession, page: int) -> Optional[Dict]:
         """Получить одну страницу discover results"""
         params = {
-            "page": page,
-            "sort_by": self.sort_by,
-            "vote_count.gte": self.min_vote_count,
-            "include_adult": False
-        }
+        "page": page,
+        "sort_by": self.sort_by,
+        "vote_count.gte": self.min_vote_count,
+        "include_adult": "false"  # ← ИСПРАВЛЕНО: строка вместо bool
+    }
         
         return await self.client._request(session, "/discover/tv", params)
     

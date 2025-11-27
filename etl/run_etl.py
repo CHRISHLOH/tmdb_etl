@@ -4,13 +4,14 @@ ETL Orchestrator
 
 Граф зависимостей:
 1. Справочники (независимые): genres, countries, languages, careers
-2. Контент (зависит от справочников): movies
+2. Контент (зависит от справочников): movies, series
 3. Персоны (зависит от countries): persons
 4. Связи (зависит от всего): content_persons, awards и т.д.
 
 Usage:
     python run_etl.py --stage dictionaries
-    python run_etl.py --stage movies --max-pages 50
+    python run_etl.py --stage movies --target-count 1000
+    python run_etl.py --stage series --target-count 500
     python run_etl.py --stage all
 """
 
@@ -24,8 +25,8 @@ try:
     from loaders.genre_loader import GenreLoader
     from loaders.country_loader import CountryLoader
     from loaders.language_loader import LanguageLoader
-    from loaders.movie_loader import MovieLoader
-    from loaders.series_loader import SeriesLoader  # NEW
+    from loaders.id_export_loader import MovieDetailsLoader
+    from loaders.series_loader import SeriesLoader
     # from loaders.person_loader import PersonLoader  # TODO
     # from loaders.career_loader import CareerLoader  # TODO
 except ImportError as e:
@@ -103,7 +104,7 @@ class ETLOrchestrator:
     def run_series(
         self,
         strategy: str = "discover",
-        target_count: int = 5000,
+        target_count: int = 500,
         load_episodes: bool = False,
         **strategy_kwargs
     ):
@@ -137,6 +138,16 @@ class ETLOrchestrator:
             ).run()
         )
     
+    def run_persons(self, max_persons: int = 1000):
+        """Этап 4: Загрузка персон"""
+        print("\n" + "="*70)
+        print(f"STAGE 4: PERSONS (max {max_persons} persons)")
+        print("="*70)
+        
+        # TODO: Implement PersonLoader
+        print("⚠️  PersonLoader not implemented yet")
+        return True
+    
     def run_all(self, target_count: int = 1000, min_popularity: float = 20):
         """Запуск всех этапов последовательно"""
         self.start_time = time.time()
@@ -156,7 +167,11 @@ class ETLOrchestrator:
         if not self.run_movies(target_count=target_count, min_popularity=min_popularity):
             print("\n⚠️  Movies stage failed, but continuing...")
         
-        # Этап 3: Персоны
+        # Этап 3: Сериалы (опционально)
+        # if not self.run_series(target_count=500, load_episodes=False):
+        #     print("\n⚠️  Series stage failed, but continuing...")
+        
+        # Этап 4: Персоны
         # if not self.run_persons():
         #     print("\n⚠️  Persons stage failed, but continuing...")
         
@@ -188,7 +203,7 @@ def main():
     parser = argparse.ArgumentParser(description="TMDB ETL Orchestrator")
     parser.add_argument(
         "--stage",
-        choices=["all", "dictionaries", "movies", "persons"],
+        choices=["all", "dictionaries", "movies", "series", "persons"],
         default="all",
         help="Which stage to run"
     )
@@ -196,13 +211,18 @@ def main():
         "--target-count",
         type=int,
         default=1000,
-        help="Target number of movies to load (top N by popularity)"
+        help="Target number of items to load (movies or series)"
     )
     parser.add_argument(
         "--min-popularity",
         type=float,
         default=20.0,
         help="Minimum popularity threshold for movies"
+    )
+    parser.add_argument(
+        "--load-episodes",
+        action="store_true",
+        help="Load episodes for series (SLOW, not recommended for MVP)"
     )
     
     args = parser.parse_args()
@@ -220,6 +240,13 @@ def main():
         success = orchestrator.run_movies(
             target_count=args.target_count,
             min_popularity=args.min_popularity
+        )
+    elif args.stage == "series":
+        success = orchestrator.run_series(
+            strategy="discover",
+            target_count=args.target_count,
+            load_episodes=args.load_episodes,
+            min_vote_count=200
         )
     elif args.stage == "persons":
         success = orchestrator.run_persons(max_persons=1000)
