@@ -94,20 +94,27 @@ class TMDBClient:
 # АСИНХРОННЫЙ КЛИЕНТ (для массовой загрузки фильмов)
 # ============================================================================
 
+import asyncio
+import aiohttp
+import time
+import os
+from typing import List, Dict, Optional
+from tqdm.asyncio import tqdm_asyncio
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
 class AsyncTMDBClient:
     """
     Асинхронный TMDB клиент с параллельными запросами.
     
-    Лимиты TMDB:
-    - 50 requests/second
-    - 20 одновременных соединений на IP
-    
-    Стратегия: используем 18 параллельных соединений и ~45 req/s
+    ИСПРАВЛЕНИЕ: семафор создается лениво внутри async-контекста
     """
     
     BASE_URL = "https://api.themoviedb.org/3"
-    MAX_CONCURRENT = 18  # Одновременных соединений (из 20 доступных)
-    REQUESTS_PER_SECOND = 45  # Безопасный предел (из 50 доступных)
+    MAX_CONCURRENT = 18
+    REQUESTS_PER_SECOND = 45
     
     def __init__(self):
         self.bearer_token = os.getenv("TMDB_BEARER_TOKEN")
@@ -119,11 +126,16 @@ class AsyncTMDBClient:
             "accept": "application/json"
         }
         
-        # Семафор для ограничения одновременных соединений
-        self.semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
-        
-        # Rate limiter для req/s
+        # НЕ создаем семафор здесь! Создадим лениво
+        self._semaphore = None
         self.request_times = []
+    
+    @property
+    def semaphore(self):
+        """Ленивое создание семафора в текущем event loop"""
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
+        return self._semaphore
     
     async def _rate_limit(self):
         """Контроль частоты запросов (req/s)"""
@@ -149,8 +161,8 @@ class AsyncTMDBClient:
     ) -> Optional[Dict]:
         """Базовый асинхронный запрос с rate limiting"""
         
-        async with self.semaphore:  # Ограничение одновременных соединений
-            await self._rate_limit()  # Rate limiting по req/s
+        async with self.semaphore:  # Теперь семафор создается в нужном event loop
+            await self._rate_limit()
             
             url = f"{self.BASE_URL}{endpoint}"
             
@@ -178,7 +190,7 @@ class AsyncTMDBClient:
         session: aiohttp.ClientSession, 
         movie_id: int
     ) -> Optional[Dict]:
-        """Получить полные данные фильма (details + translations + credits)"""
+        """Получить полные данные фильма"""
         return await self._request(
             session,
             f"/movie/{movie_id}",
@@ -193,11 +205,7 @@ class AsyncTMDBClient:
         movie_ids: List[int],
         progress_desc: str = "Fetching movies"
     ) -> List[Dict]:
-        """
-        Загрузить батч фильмов параллельно.
-        
-        Использует 18 параллельных соединений и ~45 req/s.
-        """
+        """Загрузить батч фильмов параллельно"""
         
         async with aiohttp.ClientSession(headers=self.headers) as session:
             tasks = [
@@ -205,10 +213,102 @@ class AsyncTMDBClient:
                 for movie_id in movie_ids
             ]
             
-            # Выполняем с прогресс-баром
             results = await tqdm_asyncio.gather(*tasks, desc=progress_desc)
             
-            # Фильтруем None (не найденные фильмы)
+            return [r for r in results if r is not None]
+
+
+# АЛЬТЕРНАТИВНОЕ РЕШЕНИЕ: сброс семафора перед каждым использованием
+class AsyncTMDBClientV2:
+    """
+    Альтернативный подход: явный сброс семафора
+    """
+    
+    BASE_URL = "https://api.themoviedb.org/3"
+    MAX_CONCURRENT = 18
+    REQUESTS_PER_SECOND = 45
+    
+    def __init__(self):
+        self.bearer_token = os.getenv("TMDB_BEARER_TOKEN")
+        if not self.bearer_token:
+            raise ValueError("TMDB_BEARER_TOKEN not found in env")
+        
+        self.headers = {
+            "Authorization": f"Bearer {self.bearer_token}",
+            "accept": "application/json"
+        }
+        
+        self.request_times = []
+    
+    def _reset_semaphore(self):
+        """Создать новый семафор в текущем event loop"""
+        return asyncio.Semaphore(self.MAX_CONCURRENT)
+    
+    async def _rate_limit(self):
+        """Контроль частоты запросов"""
+        now = time.time()
+        self.request_times = [t for t in self.request_times if now - t < 1.0]
+        
+        if len(self.request_times) >= self.REQUESTS_PER_SECOND:
+            sleep_time = 1.0 - (now - self.request_times[0])
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+            self.request_times = []
+        
+        self.request_times.append(now)
+    
+    async def _request(
+        self, 
+        session: aiohttp.ClientSession,
+        semaphore: asyncio.Semaphore,  # Передаем семафор явно
+        endpoint: str, 
+        params: Optional[Dict] = None
+    ) -> Optional[Dict]:
+        """Базовый запрос"""
+        
+        async with semaphore:
+            await self._rate_limit()
+            
+            url = f"{self.BASE_URL}{endpoint}"
+            
+            try:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 429:
+                        retry_after = int(response.headers.get('Retry-After', 2))
+                        await asyncio.sleep(retry_after)
+                        return await self._request(session, semaphore, endpoint, params)
+                    elif response.status == 404:
+                        return None
+                    else:
+                        return None
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                return None
+    
+    async def fetch_movies_batch(
+        self, 
+        movie_ids: List[int],
+        progress_desc: str = "Fetching"
+    ) -> List[Dict]:
+        """Загрузить батч фильмов"""
+        
+        # Создаем семафор в текущем event loop
+        semaphore = self._reset_semaphore()
+        
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            tasks = [
+                self._request(
+                    session, 
+                    semaphore, 
+                    f"/movie/{movie_id}",
+                    {"language": "en", "append_to_response": "translations"}
+                )
+                for movie_id in movie_ids
+            ]
+            
+            results = await tqdm_asyncio.gather(*tasks, desc=progress_desc)
             return [r for r in results if r is not None]
 
 
