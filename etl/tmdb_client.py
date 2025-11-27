@@ -133,6 +133,11 @@ class AsyncTMDBClient:
             return [r for r in results if r is not None]
 
 
+"""
+Асинхронный загрузчик фильмов с полной реализацией transform и load_to_db
+Добавьте это в конец файла etl/tmdb_client.py (заменив существующий класс)
+"""
+
 class AsyncMovieDetailsLoader:
     """
     Асинхронный загрузчик фильмов.
@@ -148,10 +153,53 @@ class AsyncMovieDetailsLoader:
         self.target_count = target_count
         self.min_popularity = min_popularity
         self.target_locales = os.getenv("TARGET_LOCALES", "en,ru").split(",")
+        
+        # Для БД
+        self.conn = None
+        self.cursor = None
+        self.genre_map = {}
+        self.country_map = {}
+    
+    def __enter__(self):
+        """Context manager для БД"""
+        from db import get_connection
+        self.conn = get_connection()
+        self.cursor = self.conn.cursor()
+        self._load_reference_data()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.conn.commit()
+            print("✅ Transaction committed")
+        else:
+            self.conn.rollback()
+            print(f"❌ Transaction rolled back: {exc_val}")
+        
+        self.cursor.close()
+        self.conn.close()
+    
+    def _load_reference_data(self):
+        """Загрузка справочников для маппинга"""
+        print("  Loading reference data...")
+        
+        self.cursor.execute("SELECT id, genre FROM content_service.genres")
+        for row in self.cursor.fetchall():
+            genre_id, genre = row
+            self.genre_map[genre] = genre_id
+        
+        self.cursor.execute("SELECT id, iso_code FROM content_service.countries")
+        for row in self.cursor.fetchall():
+            country_id, iso_code = row
+            self.country_map[iso_code] = country_id
+        
+        print(f"  Loaded {len(self.genre_map)} genres, {len(self.country_map)} countries")
     
     def get_movie_ids(self) -> List[int]:
         """Получить список ID из daily export"""
         from loaders.id_export_loader import IDExportLoader
+        
+        print(f"\n📥 Fetching top {self.target_count} movie IDs...")
         
         id_loader = IDExportLoader(media_type="movie")
         return id_loader.get_filtered_ids(
@@ -178,12 +226,186 @@ class AsyncMovieDetailsLoader:
         )
         
         elapsed = time.time() - start
-        actual_rate = len(results) / elapsed
+        actual_rate = len(results) / elapsed if elapsed > 0 else 0
         
         print(f"\n✅ Fetched {len(results)} movies in {elapsed:.1f}s")
         print(f"📊 Actual rate: {actual_rate:.1f} req/s")
         
         return results
+    
+    def transform(self, raw_data: List[Dict]) -> Dict[str, List]:
+        """
+        Трансформация данных из TMDB в формат БД.
+        
+        Returns:
+            Dict с ключами: content, movie_details, translations, genres, countries
+        """
+        content_data = []
+        movie_details_data = []
+        translations_data = []
+        genres_data = []
+        countries_data = []
+        
+        for movie in raw_data:
+            tmdb_id = movie["id"]
+            
+            # 1. content
+            content_data.append((
+                tmdb_id,
+                movie.get("original_title", "Unknown"),
+                "movie",
+                movie.get("poster_path"),
+                movie.get("release_date"),
+                "published",
+                None,  # age_rating
+                movie.get("budget"),
+                movie.get("revenue")
+            ))
+            
+            # 2. movie_details
+            runtime = movie.get("runtime")
+            if runtime:
+                movie_details_data.append((
+                    tmdb_id,
+                    runtime,
+                    movie.get("release_date"),
+                    None  # digital_release_date
+                ))
+            
+            # 3. translations
+            translations = movie.get("translations", {}).get("translations", [])
+            for translation in translations:
+                iso_639_1 = translation.get("iso_639_1")
+                data = translation.get("data", {})
+                title = data.get("title") or movie.get("original_title")
+                overview = data.get("overview")
+                
+                if iso_639_1 in self.target_locales:
+                    translations_data.append((
+                        tmdb_id,
+                        iso_639_1,
+                        title,
+                        overview,
+                        None  # plot_summary
+                    ))
+            
+            # 4. genres
+            for idx, genre in enumerate(movie.get("genres", [])):
+                genre_name = genre["name"].lower().replace(" ", "_")
+                if genre_name in self.genre_map:
+                    genres_data.append((
+                        tmdb_id,
+                        self.genre_map[genre_name],
+                        idx
+                    ))
+            
+            # 5. countries
+            for country in movie.get("production_countries", []):
+                iso_code = country["iso_3166_1"]
+                if iso_code in self.country_map:
+                    countries_data.append((
+                        tmdb_id,
+                        self.country_map[iso_code]
+                    ))
+        
+        return {
+            "content": content_data,
+            "movie_details": movie_details_data,
+            "translations": translations_data,
+            "genres": genres_data,
+            "countries": countries_data
+        }
+    
+    def load_to_db(self, data: Dict[str, List]):
+        """Загрузка в БД"""
+        from psycopg2.extras import execute_batch
+        from tqdm import tqdm
+        
+        # 1. content
+        if data["content"]:
+            print(f"\n📤 Loading content ({len(data['content'])} records)...")
+            query = """
+                INSERT INTO content_service.content 
+                (id, original_title, content_type, poster_url, release_date, status, age_rating, budget, box_office)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    original_title = EXCLUDED.original_title,
+                    poster_url = EXCLUDED.poster_url,
+                    release_date = EXCLUDED.release_date,
+                    budget = EXCLUDED.budget,
+                    box_office = EXCLUDED.box_office,
+                    updated_at = NOW()
+            """
+            with tqdm(total=len(data["content"]), desc="Loading content") as pbar:
+                for i in range(0, len(data["content"]), 1000):
+                    batch = data["content"][i:i + 1000]
+                    execute_batch(self.cursor, query, batch)
+                    pbar.update(len(batch))
+        
+        # 2. movie_details
+        if data["movie_details"]:
+            print(f"\n📤 Loading movie_details ({len(data['movie_details'])} records)...")
+            query = """
+                INSERT INTO content_service.movie_details 
+                (content_id, duration_minutes, cinema_release_date, digital_release_date)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (content_id) DO UPDATE SET
+                    duration_minutes = EXCLUDED.duration_minutes,
+                    cinema_release_date = EXCLUDED.cinema_release_date,
+                    updated_at = NOW()
+            """
+            with tqdm(total=len(data["movie_details"]), desc="Loading movie_details") as pbar:
+                for i in range(0, len(data["movie_details"]), 1000):
+                    batch = data["movie_details"][i:i + 1000]
+                    execute_batch(self.cursor, query, batch)
+                    pbar.update(len(batch))
+        
+        # 3. translations
+        if data["translations"]:
+            print(f"\n📤 Loading translations ({len(data['translations'])} records)...")
+            query = """
+                INSERT INTO content_service.content_translations 
+                (content_id, locale, title, description, plot_summary)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (content_id, locale) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    description = EXCLUDED.description,
+                    updated_at = NOW()
+            """
+            with tqdm(total=len(data["translations"]), desc="Loading translations") as pbar:
+                for i in range(0, len(data["translations"]), 1000):
+                    batch = data["translations"][i:i + 1000]
+                    execute_batch(self.cursor, query, batch)
+                    pbar.update(len(batch))
+        
+        # 4. genres
+        if data["genres"]:
+            print(f"\n📤 Loading genres ({len(data['genres'])} records)...")
+            query = """
+                INSERT INTO content_service.content_genres (content_id, genre_id, display_order)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (content_id, genre_id) DO UPDATE SET
+                    display_order = EXCLUDED.display_order
+            """
+            with tqdm(total=len(data["genres"]), desc="Loading genres") as pbar:
+                for i in range(0, len(data["genres"]), 1000):
+                    batch = data["genres"][i:i + 1000]
+                    execute_batch(self.cursor, query, batch)
+                    pbar.update(len(batch))
+        
+        # 5. countries
+        if data["countries"]:
+            print(f"\n📤 Loading countries ({len(data['countries'])} records)...")
+            query = """
+                INSERT INTO content_service.content_countries (content_id, country_id)
+                VALUES (%s, %s)
+                ON CONFLICT (content_id, country_id) DO NOTHING
+            """
+            with tqdm(total=len(data["countries"]), desc="Loading countries") as pbar:
+                for i in range(0, len(data["countries"]), 1000):
+                    batch = data["countries"][i:i + 1000]
+                    execute_batch(self.cursor, query, batch)
+                    pbar.update(len(batch))
     
     def run(self):
         """Запуск асинхронной загрузки"""
@@ -192,31 +414,22 @@ class AsyncMovieDetailsLoader:
         print(f"Target: {self.target_count} movies (min popularity: {self.min_popularity})")
         print(f"{'='*60}\n")
         
-        # Получаем ID
-        movie_ids = self.get_movie_ids()
-        
-        # Загружаем асинхронно
-        movies_data = asyncio.run(self.fetch_all_movies(movie_ids))
-        
-        # Трансформация и загрузка в БД
-        print("\n⚙️  Transforming data...")
-        transformed = self.transform(movies_data)
-        
-        print("\n📤 Loading to database...")
-        self.load_to_db(transformed)
+        with self:
+            # 1. Получаем ID из export
+            movie_ids = self.get_movie_ids()
+            
+            # 2. Загружаем асинхронно через API
+            movies_data = asyncio.run(self.fetch_all_movies(movie_ids))
+            
+            # 3. Трансформация
+            print("\n⚙️  Transforming data...")
+            transformed = self.transform(movies_data)
+            print(f"✅ Transformed {len(movies_data)} movies")
+            
+            # 4. Загрузка в БД
+            self.load_to_db(transformed)
         
         print(f"\n✅ Completed successfully\n")
-    
-    def transform(self, raw_data: List[Dict]) -> Dict[str, List]:
-        """Трансформация данных (как в MovieDetailsLoader)"""
-        # TODO: реализовать трансформацию
-        pass
-    
-    def load_to_db(self, data: Dict[str, List]):
-        """Загрузка в БД (как в MovieDetailsLoader)"""
-        # TODO: реализовать загрузку
-        pass
-
 
 # Утилита для теста скорости
 async def benchmark_api():

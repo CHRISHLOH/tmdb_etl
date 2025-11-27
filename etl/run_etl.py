@@ -1,22 +1,17 @@
 """
-ETL Orchestrator
+ETL Orchestrator с поддержкой асинхронной загрузки
 Запускает все загрузчики в правильном порядке с учетом зависимостей.
-
-Граф зависимостей:
-1. Справочники (независимые): genres, countries, languages, careers
-2. Контент (зависит от справочников): movies
-3. Персоны (зависит от countries): persons
-4. Связи (зависит от всего): content_persons, awards и т.д.
 
 Usage:
     python run_etl.py --stage dictionaries
-    python run_etl.py --stage movies --max-pages 50
-    python run_etl.py --stage all
+    python run_etl.py --stage movies --target-count 1000 --async
+    python run_etl.py --stage all --async
 """
 
 import argparse
 import sys
 import time
+import asyncio
 from datetime import datetime
 
 # Импорты загрузчиков
@@ -25,8 +20,7 @@ try:
     from loaders.country_loader import CountryLoader
     from loaders.language_loader import LanguageLoader
     from loaders.id_export_loader import MovieDetailsLoader
-    # from loaders.person_loader import PersonLoader  # TODO
-    # from loaders.career_loader import CareerLoader  # TODO
+    from tmdb_client import AsyncMovieDetailsLoader  # Новый импорт
 except ImportError as e:
     print(f"❌ Import error: {e}")
     print("Make sure all loader modules are in loaders/ directory")
@@ -65,7 +59,7 @@ class ETLOrchestrator:
             return False
     
     def run_dictionaries(self):
-        """Этап 1: Загрузка справочников (параллельно могут грузиться)"""
+        """Этап 1: Загрузка справочников"""
         print("\n" + "="*70)
         print("STAGE 1: DICTIONARIES")
         print("="*70)
@@ -74,7 +68,6 @@ class ETLOrchestrator:
             ("Genres", lambda: GenreLoader().run()),
             ("Countries", lambda: CountryLoader().run()),
             ("Languages", lambda: LanguageLoader().run()),
-            # ("Careers", lambda: CareerLoader().run()),  # TODO: добавить когда будет готов
         ]
         
         success_count = 0
@@ -85,19 +78,47 @@ class ETLOrchestrator:
         print(f"\n📊 Dictionaries stage: {success_count}/{len(stages)} successful")
         return success_count == len(stages)
     
-    def run_movies(self, target_count: int = 1000, min_popularity: float = 20):
-        """Этап 2: Загрузка фильмов через daily exports + API"""
+    def run_movies(
+        self, 
+        target_count: int = 1000, 
+        min_popularity: float = 20,
+        use_async: bool = False
+    ):
+        """
+        Этап 2: Загрузка фильмов
+        
+        Args:
+            target_count: Количество фильмов
+            min_popularity: Минимальная популярность
+            use_async: Использовать асинхронную загрузку (в 7-10 раз быстрее!)
+        """
         print("\n" + "="*70)
-        print(f"STAGE 2: MOVIES (target: {target_count}, min popularity: {min_popularity})")
+        mode = "ASYNC" if use_async else "SYNC"
+        print(f"STAGE 2: MOVIES [{mode}] (target: {target_count}, min popularity: {min_popularity})")
+        
+        if use_async:
+            print("⚡ Using async loader (18 parallel connections, ~45 req/s)")
+        else:
+            print("🐌 Using sync loader (~9 req/s)")
+        
         print("="*70)
         
-        return self.run_stage(
-            "Movies", 
-            lambda: MovieDetailsLoader(
+        if use_async:
+            # Асинхронный загрузчик
+            loader = AsyncMovieDetailsLoader(
                 target_count=target_count,
                 min_popularity=min_popularity
-            ).run()
-        )
+            )
+            return self.run_stage("Movies (Async)", lambda: loader.run())
+        else:
+            # Синхронный загрузчик (старый)
+            return self.run_stage(
+                "Movies (Sync)", 
+                lambda: MovieDetailsLoader(
+                    target_count=target_count,
+                    min_popularity=min_popularity
+                ).run()
+            )
     
     def run_persons(self, max_persons: int = 1000):
         """Этап 3: Загрузка персон"""
@@ -105,11 +126,15 @@ class ETLOrchestrator:
         print(f"STAGE 3: PERSONS (max {max_persons} persons)")
         print("="*70)
         
-        # TODO: Implement PersonLoader
         print("⚠️  PersonLoader not implemented yet")
         return True
     
-    def run_all(self, target_count: int = 1000, min_popularity: float = 20):
+    def run_all(
+        self, 
+        target_count: int = 1000, 
+        min_popularity: float = 20,
+        use_async: bool = False
+    ):
         """Запуск всех этапов последовательно"""
         self.start_time = time.time()
         
@@ -125,12 +150,12 @@ class ETLOrchestrator:
             return False
         
         # Этап 2: Фильмы
-        if not self.run_movies(target_count=target_count, min_popularity=min_popularity):
+        if not self.run_movies(
+            target_count=target_count, 
+            min_popularity=min_popularity,
+            use_async=use_async
+        ):
             print("\n⚠️  Movies stage failed, but continuing...")
-        
-        # Этап 3: Персоны
-        # if not self.run_persons():
-        #     print("\n⚠️  Persons stage failed, but continuing...")
         
         # Финальный отчет
         self._print_final_report()
@@ -176,6 +201,12 @@ def main():
         default=20.0,
         help="Minimum popularity threshold for movies"
     )
+    parser.add_argument(
+        "--async",
+        dest="use_async",
+        action="store_true",
+        help="Use async loader for movies (7-10x faster!)"
+    )
     
     args = parser.parse_args()
     
@@ -184,14 +215,16 @@ def main():
     if args.stage == "all":
         success = orchestrator.run_all(
             target_count=args.target_count,
-            min_popularity=args.min_popularity
+            min_popularity=args.min_popularity,
+            use_async=args.use_async
         )
     elif args.stage == "dictionaries":
         success = orchestrator.run_dictionaries()
     elif args.stage == "movies":
         success = orchestrator.run_movies(
             target_count=args.target_count,
-            min_popularity=args.min_popularity
+            min_popularity=args.min_popularity,
+            use_async=args.use_async
         )
     elif args.stage == "persons":
         success = orchestrator.run_persons(max_persons=1000)
