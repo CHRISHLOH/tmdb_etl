@@ -1,8 +1,8 @@
 """
-Асинхронный загрузчик с параллельными запросами.
-Использует лимиты TMDB: 50 req/s и 20 одновременных соединений.
+TMDB API клиенты: синхронный и асинхронный
 """
 
+import requests
 import asyncio
 import aiohttp
 import time
@@ -14,6 +14,86 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# ============================================================================
+# СИНХРОННЫЙ КЛИЕНТ (для справочников и старого кода)
+# ============================================================================
+
+class TMDBClient:
+    """
+    Синхронный TMDB API client с rate limiting.
+    Используется для справочников (genres, countries, languages).
+    """
+    
+    BASE_URL = "https://api.themoviedb.org/3"
+    MIN_DELAY = 0.11  # 110ms = ~9 req/s (было 0.26s)
+    
+    def __init__(self):
+        self.bearer_token = os.getenv("TMDB_BEARER_TOKEN")
+        if not self.bearer_token:
+            raise ValueError("TMDB_BEARER_TOKEN not found in .env")
+        
+        self.headers = {
+            "Authorization": f"Bearer {self.bearer_token}",
+            "accept": "application/json"
+        }
+        self.last_request_time = 0
+    
+    def _rate_limit(self):
+        """Простой rate limiter"""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.MIN_DELAY:
+            time.sleep(self.MIN_DELAY - elapsed)
+        self.last_request_time = time.time()
+    
+    def _request(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
+        """Базовый запрос с retry logic"""
+        self._rate_limit()
+        
+        url = f"{self.BASE_URL}{endpoint}"
+        
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 2))
+                print(f"⚠️  Rate limit hit, waiting {retry_after}s")
+                time.sleep(retry_after)
+                return self._request(endpoint, params)
+            elif response.status_code == 404:
+                return None
+            else:
+                print(f"❌ HTTP {response.status_code}: {url}")
+                return None
+        
+        except requests.RequestException as e:
+            print(f"❌ Request failed: {e}")
+            return None
+    
+    def get_configuration(self) -> Optional[Dict]:
+        """Получить конфигурацию TMDB"""
+        return self._request("/configuration")
+    
+    def get_genres(self, media_type: str = "movie", language: str = "en") -> List[Dict]:
+        """Получить список жанров"""
+        result = self._request(f"/genre/{media_type}/list", params={"language": language})
+        return result.get("genres", []) if result else []
+    
+    def get_movie_details(self, movie_id: int, language: str = "en") -> Optional[Dict]:
+        """Получить детали фильма"""
+        return self._request(f"/movie/{movie_id}", params={"language": language})
+    
+    def get_movie_translations(self, movie_id: int) -> List[Dict]:
+        """Получить переводы фильма"""
+        result = self._request(f"/movie/{movie_id}/translations")
+        return result.get("translations", []) if result else []
+
+
+# ============================================================================
+# АСИНХРОННЫЙ КЛИЕНТ (для массовой загрузки фильмов)
+# ============================================================================
+
 class AsyncTMDBClient:
     """
     Асинхронный TMDB клиент с параллельными запросами.
@@ -22,8 +102,7 @@ class AsyncTMDBClient:
     - 50 requests/second
     - 20 одновременных соединений на IP
     
-    Стратегия: используем 18 параллельных соединений (запас под лимит 20)
-    и ~40-45 req/s (запас под лимит 50).
+    Стратегия: используем 18 параллельных соединений и ~45 req/s
     """
     
     BASE_URL = "https://api.themoviedb.org/3"
@@ -133,10 +212,9 @@ class AsyncTMDBClient:
             return [r for r in results if r is not None]
 
 
-"""
-Асинхронный загрузчик фильмов с полной реализацией transform и load_to_db
-Добавьте это в конец файла etl/tmdb_client.py (заменив существующий класс)
-"""
+# ============================================================================
+# АСИНХРОННЫЙ ЗАГРУЗЧИК ФИЛЬМОВ
+# ============================================================================
 
 class AsyncMovieDetailsLoader:
     """
@@ -431,7 +509,11 @@ class AsyncMovieDetailsLoader:
         
         print(f"\n✅ Completed successfully\n")
 
-# Утилита для теста скорости
+
+# ============================================================================
+# УТИЛИТЫ
+# ============================================================================
+
 async def benchmark_api():
     """Тест максимальной скорости API"""
     client = AsyncTMDBClient()
@@ -455,8 +537,8 @@ async def benchmark_api():
 
 if __name__ == "__main__":
     # Запуск бенчмарка
-    # asyncio.run(benchmark_api())
+    asyncio.run(benchmark_api())
     
     # Или загрузка фильмов
-    loader = AsyncMovieDetailsLoader(target_count=100, min_popularity=30)
-    loader.run()
+    # loader = AsyncMovieDetailsLoader(target_count=100, min_popularity=30)
+    # loader.run()
