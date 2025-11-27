@@ -1,23 +1,17 @@
 """
-ETL Orchestrator с поддержкой стратегий загрузки фильмов.
+ETL Orchestrator
+Запускает все загрузчики в правильном порядке с учетом зависимостей.
+
+Граф зависимостей:
+1. Справочники (независимые): genres, countries, languages, careers
+2. Контент (зависит от справочников): movies
+3. Персоны (зависит от countries): persons
+4. Связи (зависит от всего): content_persons, awards и т.д.
 
 Usage:
-    # Справочники
     python run_etl.py --stage dictionaries
-    
-    # Фильмы через разные стратегии:
-    
-    # 1. Discover (топ 10k, быстро)
-    python run_etl.py --stage movies --strategy discover --target-count 10000
-    
-    # 2. Discover Segmented (топ 50k, сегментация по годам)
-    python run_etl.py --stage movies --strategy discover-segmented --target-count 50000 --year-from 1990
-    
-    # 3. Export (legacy, через daily dump)
-    python run_etl.py --stage movies --strategy export --target-count 1000 --min-popularity 20
-    
-    # Полный пайплайн
-    python run_etl.py --stage all --strategy discover-segmented --target-count 30000
+    python run_etl.py --stage movies --max-pages 50
+    python run_etl.py --stage all
 """
 
 import argparse
@@ -30,7 +24,10 @@ try:
     from loaders.genre_loader import GenreLoader
     from loaders.country_loader import CountryLoader
     from loaders.language_loader import LanguageLoader
-    from loaders.movie_loader import MovieLoader  # НОВЫЙ РЕФАКТОРЕННЫЙ
+    from loaders.movie_loader import MovieLoader
+    from loaders.series_loader import SeriesLoader  # NEW
+    # from loaders.person_loader import PersonLoader  # TODO
+    # from loaders.career_loader import CareerLoader  # TODO
 except ImportError as e:
     print(f"❌ Import error: {e}")
     print("Make sure all loader modules are in loaders/ directory")
@@ -39,7 +36,8 @@ except ImportError as e:
 
 class ETLOrchestrator:
     """
-    Оркестратор ETL процессов с поддержкой стратегий.
+    Оркестратор ETL процессов.
+    Управляет порядком выполнения и обрабатывает ошибки.
     """
     
     def __init__(self):
@@ -61,13 +59,14 @@ class ETLOrchestrator:
             print(f"❌ {error_msg}")
             self.errors.append(error_msg)
             
+            # Логируем полный traceback
             import traceback
             traceback.print_exc()
             
             return False
     
     def run_dictionaries(self):
-        """Этап 1: Загрузка справочников"""
+        """Этап 1: Загрузка справочников (параллельно могут грузиться)"""
         print("\n" + "="*70)
         print("STAGE 1: DICTIONARIES")
         print("="*70)
@@ -76,6 +75,7 @@ class ETLOrchestrator:
             ("Genres", lambda: GenreLoader().run()),
             ("Countries", lambda: CountryLoader().run()),
             ("Languages", lambda: LanguageLoader().run()),
+            # ("Careers", lambda: CareerLoader().run()),  # TODO: добавить когда будет готов
         ]
         
         success_count = 0
@@ -86,69 +86,79 @@ class ETLOrchestrator:
         print(f"\n📊 Dictionaries stage: {success_count}/{len(stages)} successful")
         return success_count == len(stages)
     
-    def run_movies(
+    def run_movies(self, target_count: int = 1000, min_popularity: float = 20):
+        """Этап 2: Загрузка фильмов через daily exports + API"""
+        print("\n" + "="*70)
+        print(f"STAGE 2: MOVIES (target: {target_count}, min popularity: {min_popularity})")
+        print("="*70)
+        
+        return self.run_stage(
+            "Movies", 
+            lambda: MovieDetailsLoader(
+                target_count=target_count,
+                min_popularity=min_popularity
+            ).run()
+        )
+    
+    def run_series(
         self,
         strategy: str = "discover",
-        target_count: int = 10000,
+        target_count: int = 5000,
+        load_episodes: bool = False,
         **strategy_kwargs
     ):
         """
-        Этап 2: Загрузка фильмов с выбранной стратегией.
+        Этап 3: Загрузка сериалов.
         
         Args:
-            strategy: "discover", "discover-segmented", или "export"
-            target_count: Количество фильмов
+            strategy: "discover"
+            target_count: Количество сериалов
+            load_episodes: Загружать ли эпизоды (МЕДЛЕННО, для MVP = False)
             **strategy_kwargs: Параметры для стратегии
         """
         print("\n" + "="*70)
-        print(f"STAGE 2: MOVIES")
+        print(f"STAGE 3: SERIES")
         print(f"Strategy: {strategy}")
-        print(f"Target: {target_count} movies")
+        print(f"Target: {target_count} series")
+        print(f"Load episodes: {load_episodes}")
         print("="*70)
         
-        # Описание стратегий
-        strategy_info = {
-            "discover": "Fast: Top 10k via /discover (no segmentation)",
-            "discover-segmented": "Medium: 50k+ via year segmentation",
-            "export": "Legacy: via daily export dump (slow)"
-        }
-        
-        print(f"📝 {strategy_info.get(strategy, 'Unknown strategy')}\n")
+        if load_episodes:
+            print("⚠️  WARNING: load_episodes=True will be VERY SLOW")
+            print("   Consider loading only series + seasons for MVP")
         
         return self.run_stage(
-            f"Movies ({strategy})",
-            lambda: MovieLoader(
+            f"Series ({strategy})",
+            lambda: SeriesLoader(
                 strategy=strategy,
                 target_count=target_count,
+                load_episodes=load_episodes,
                 **strategy_kwargs
             ).run()
         )
     
-    def run_all(
-        self,
-        strategy: str = "discover",
-        target_count: int = 10000,
-        **strategy_kwargs
-    ):
-        """Запуск всех этапов"""
+    def run_all(self, target_count: int = 1000, min_popularity: float = 20):
+        """Запуск всех этапов последовательно"""
         self.start_time = time.time()
         
         print("\n" + "🎬 "*35)
         print("FULL ETL PIPELINE STARTED")
         print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Strategy: {strategy}")
-        print(f"Target: {target_count} movies")
         print("🎬 "*35 + "\n")
         
-        # Этап 1: Справочники
+        # Этап 1: Справочники (обязательно)
         if not self.run_dictionaries():
             print("\n❌ Critical error: Dictionaries stage failed")
             print("Cannot continue without reference data")
             return False
         
         # Этап 2: Фильмы
-        if not self.run_movies(strategy, target_count, **strategy_kwargs):
-            print("\n⚠️  Movies stage failed")
+        if not self.run_movies(target_count=target_count, min_popularity=min_popularity):
+            print("\n⚠️  Movies stage failed, but continuing...")
+        
+        # Этап 3: Персоны
+        # if not self.run_persons():
+        #     print("\n⚠️  Persons stage failed, but continuing...")
         
         # Финальный отчет
         self._print_final_report()
@@ -162,10 +172,10 @@ class ETLOrchestrator:
         print("\n" + "="*70)
         print("ETL PIPELINE COMPLETED")
         print("="*70)
-        print(f"Total time: {elapsed:.2f}s ({elapsed/60:.2f} minutes)")
+        print(f"Total time: {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
         
         if self.errors:
-            print(f"\n❌ Errors: {len(self.errors)}")
+            print(f"\n❌ Errors encountered: {len(self.errors)}")
             for i, error in enumerate(self.errors, 1):
                 print(f"  {i}. {error}")
         else:
@@ -175,117 +185,44 @@ class ETLOrchestrator:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="TMDB ETL Orchestrator with Strategy Support",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Топ 10,000 популярных (быстро)
-  python run_etl.py --stage movies --strategy discover --target-count 10000
-  
-  # Топ 50,000 через сегментацию (1990-2024)
-  python run_etl.py --stage movies --strategy discover-segmented --target-count 50000 --year-from 1990
-  
-  # Legacy через daily export
-  python run_etl.py --stage movies --strategy export --target-count 1000 --min-popularity 20
-  
-  # Полный пайплайн
-  python run_etl.py --stage all --strategy discover-segmented --target-count 30000
-        """
-    )
-    
+    parser = argparse.ArgumentParser(description="TMDB ETL Orchestrator")
     parser.add_argument(
         "--stage",
-        choices=["all", "dictionaries", "movies"],
+        choices=["all", "dictionaries", "movies", "persons"],
         default="all",
         help="Which stage to run"
     )
-    
-    parser.add_argument(
-        "--strategy",
-        choices=["discover", "discover-segmented", "export"],
-        default="discover",
-        help="Movie loading strategy"
-    )
-    
     parser.add_argument(
         "--target-count",
         type=int,
-        default=10000,
-        help="Number of movies to load"
+        default=1000,
+        help="Target number of movies to load (top N by popularity)"
     )
-    
-    # Параметры для discover-segmented
-    parser.add_argument(
-        "--year-from",
-        type=int,
-        default=1990,
-        help="Start year for segmented strategy (default: 1990)"
-    )
-    
-    parser.add_argument(
-        "--year-to",
-        type=int,
-        default=None,
-        help="End year for segmented strategy (default: current year)"
-    )
-    
-    # Параметры для discover/discover-segmented
-    parser.add_argument(
-        "--sort-by",
-        default="popularity.desc",
-        help="Sort order (popularity.desc, vote_average.desc, etc)"
-    )
-    
-    parser.add_argument(
-        "--min-vote-count",
-        type=int,
-        default=100,
-        help="Minimum vote count filter"
-    )
-    
-    # Параметры для export
     parser.add_argument(
         "--min-popularity",
         type=float,
         default=20.0,
-        help="Minimum popularity for export strategy"
+        help="Minimum popularity threshold for movies"
     )
     
     args = parser.parse_args()
     
-    # Подготовка kwargs для стратегии
-    strategy_kwargs = {}
-    
-    if args.strategy in ["discover", "discover-segmented"]:
-        strategy_kwargs["sort_by"] = args.sort_by
-        strategy_kwargs["min_vote_count"] = args.min_vote_count
-        
-        if args.strategy == "discover-segmented":
-            strategy_kwargs["year_from"] = args.year_from
-            if args.year_to:
-                strategy_kwargs["year_to"] = args.year_to
-    
-    elif args.strategy == "export":
-        strategy_kwargs["min_popularity"] = args.min_popularity
-    
-    # Запуск
     orchestrator = ETLOrchestrator()
     
     if args.stage == "all":
         success = orchestrator.run_all(
-            strategy=args.strategy,
             target_count=args.target_count,
-            **strategy_kwargs
+            min_popularity=args.min_popularity
         )
     elif args.stage == "dictionaries":
         success = orchestrator.run_dictionaries()
     elif args.stage == "movies":
         success = orchestrator.run_movies(
-            strategy=args.strategy,
             target_count=args.target_count,
-            **strategy_kwargs
+            min_popularity=args.min_popularity
         )
+    elif args.stage == "persons":
+        success = orchestrator.run_persons(max_persons=1000)
     
     sys.exit(0 if success else 1)
 
