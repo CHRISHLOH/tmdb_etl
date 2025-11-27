@@ -4,3 +4,4 @@ tqdm
 python-dateutil
 ujson
 python-dotenv
+aiohttp

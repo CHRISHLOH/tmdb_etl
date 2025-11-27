@@ -19,8 +19,12 @@ class LanguageLoader(BaseLoader):
         TMDB Configuration содержит список языков.
         Структура: {iso_639_1: "en", english_name: "English", name: "English"}
         """
-        config = self.client.get_configuration()
-        languages = config.get("languages", [])
+        # TMDB API endpoint для списка языков
+        languages = self.client._request("/configuration/languages")
+        
+        if not languages:
+            print("⚠️  Could not fetch languages from TMDB API")
+            return []
 
         result = []
         for lang in languages:
@@ -34,7 +38,7 @@ class LanguageLoader(BaseLoader):
                     "native_name": native_name,
                     "translations": {
                         "en": english_name
-                        # TODO: Можно добавить ru переводы
+                        # TODO: Можно добавить ru переводы вручную для основных языков
                     }
                 })
 
