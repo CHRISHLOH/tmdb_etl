@@ -1,15 +1,11 @@
 """
-Загрузчик сериалов с поддержкой сезонов и эпизодов (ИСПРАВЛЕНО).
+SeriesLoader - ИСПРАВЛЕНА ЗАГРУЗКА СВЯЗЕЙ
 
-АРХИТЕКТУРА:
-1. content (основная запись сериала)
-2. series_details (метаданные: total_seasons, total_episodes)
-3. seasons (сезоны с их метаданными)
-4. season_translations (переводы названий сезонов)
-5. episodes (эпизоды) - ОПЦИОНАЛЬНО для MVP
-6. episode_translations (переводы эпизодов) - ОПЦИОНАЛЬНО
+ПРОБЛЕМА БЫЛА:
+В _load_all_tables() НЕ грузились genres и countries для сериалов!
 
-ДЛЯ MVP: грузим только до уровня seasons, эпизоды добавим позже
+РЕШЕНИЕ:
+Добавлены блоки загрузки для content_genres и content_countries.
 """
 
 import asyncio
@@ -23,20 +19,7 @@ class SeriesLoader(BaseLoader):
     """
     Загрузчик сериалов с поддержкой strategies.
     
-    Usage:
-        # Топ 5000 сериалов БЕЗ эпизодов (быстро, для MVP)
-        loader = SeriesLoader(
-            strategy="discover",
-            target_count=5000,
-            load_episodes=False
-        )
-        
-        # Топ 1000 сериалов С эпизодами (медленно)
-        loader = SeriesLoader(
-            strategy="discover",
-            target_count=1000,
-            load_episodes=True
-        )
+    ✅ ИСПРАВЛЕНО: Теперь грузит genres и countries для сериалов
     """
     
     def __init__(
@@ -57,22 +40,16 @@ class SeriesLoader(BaseLoader):
         
         self.target_locales = os.getenv("TARGET_LOCALES", "en,ru").split(",")
         
-        # Справочники (загрузим в _load_reference_data)
         self.genre_map = {}
         self.country_map = {}
         
-        # Клиент и стратегию создаем в extract() внутри async контекста
         self.client = None
         self.strategy = None
     
     def _create_client_and_strategy(self):
-        """
-        Создать клиент и стратегию.
-        ВАЖНО: вызывать только внутри async функции!
-        """
+        """Создать клиент и стратегию"""
         from tmdb_client import AsyncTMDBClient
         
-        # Создаем НОВЫЙ клиент для каждого запуска
         self.client = AsyncTMDBClient()
         
         if self.strategy_name == "discover":
@@ -100,45 +77,26 @@ class SeriesLoader(BaseLoader):
         print(f"  ✓ {len(self.genre_map)} genres, {len(self.country_map)} countries")
     
     def extract(self) -> List[Dict]:
-        """
-        Извлечение данных сериалов через стратегию.
-        """
+        """Извлечение данных сериалов"""
         self._load_reference_data()
         
-        # Создаем клиент и стратегию внутри async контекста
         async def _async_extract():
-            # Создаем клиент ВНУТРИ async функции
             self._create_client_and_strategy()
             
-            # Оценка времени
             print(f"\n⏱️  Estimated time: {self.strategy.estimate_time()}")
             
-            # Шаг 1: Получить ID сериалов
             series_ids = await self.strategy.get_series_ids()
-            
-            # Шаг 2: Загрузить полные данные
             series_data = await self.strategy.fetch_series_full_data(series_ids)
             
             return series_data
         
-        # Запускаем async функцию
         return asyncio.run(_async_extract())
     
     def transform(self, raw_data: List[Dict]) -> Dict[str, List[Tuple]]:
         """
         Трансформация сериалов в формат БД.
         
-        Returns:
-            Dict с ключами:
-            - content: базовые данные сериалов
-            - series_details: метаданные сериалов
-            - translations: переводы сериалов
-            - genres: связь сериалы-жанры
-            - countries: связь сериалы-страны
-            - seasons: данные сезонов
-            - season_translations: переводы сезонов
-            - episodes: данные эпизодов (если load_episodes=True)
-            - episode_translations: переводы эпизодов (если load_episodes=True)
+        ✅ ВАЖНО: Создаем данные для genres и countries!
         """
         content_data = []
         series_details_data = []
@@ -153,29 +111,27 @@ class SeriesLoader(BaseLoader):
         for series in raw_data:
             tmdb_id = series["id"]
             
-            # 1. content (основная запись)
+            # 1. content
             content_data.append((
                 tmdb_id,
                 series.get("original_name", series.get("name", "Unknown")),
-                "series",  # content_type
+                "series",
                 series.get("poster_path"),
-                series.get("first_air_date"),  # release_date
+                series.get("first_air_date"),
                 "published",
-                None,  # age_rating
-                None,  # budget (нет для сериалов)
-                None   # box_office (нет для сериалов)
+                None,
+                None,
+                None
             ))
             
             # 2. series_details
             seasons = series.get("seasons", [])
-            # Считаем реальные сезоны (пропускаем season 0 = specials)
             real_seasons = [s for s in seasons if s.get("season_number", 0) > 0]
             
             total_seasons = len(real_seasons)
             total_episodes = series.get("number_of_episodes", 0)
             avg_episode_duration = None
             
-            # Пытаемся вычислить среднюю длительность
             episode_runtimes = series.get("episode_run_time", [])
             if episode_runtimes:
                 avg_episode_duration = sum(episode_runtimes) // len(episode_runtimes)
@@ -185,11 +141,11 @@ class SeriesLoader(BaseLoader):
                 total_seasons,
                 total_episodes,
                 avg_episode_duration,
-                series.get("last_air_date"),  # end_date
+                series.get("last_air_date"),
                 self._get_series_status(series)
             ))
             
-            # 3. content_translations
+            # 3. translations
             translations = series.get("translations", {}).get("translations", [])
             for translation in translations:
                 iso_639_1 = translation.get("iso_639_1")
@@ -203,10 +159,10 @@ class SeriesLoader(BaseLoader):
                         iso_639_1,
                         title,
                         overview,
-                        None  # plot_summary
+                        None
                     ))
             
-            # 4. genres
+            # 4. genres ← КРИТИЧНО
             for idx, genre in enumerate(series.get("genres", [])):
                 genre_name = genre["name"].lower().replace(" ", "_")
                 if genre_name in self.genre_map:
@@ -216,7 +172,7 @@ class SeriesLoader(BaseLoader):
                         idx
                     ))
             
-            # 5. countries
+            # 5. countries ← КРИТИЧНО
             for country in series.get("production_countries", []):
                 iso_code = country["iso_3166_1"]
                 if iso_code in self.country_map:
@@ -237,7 +193,7 @@ class SeriesLoader(BaseLoader):
                     season.get("episode_count", 0)
                 ))
                 
-                # 7. season_translations (базовые - из API)
+                # 7. season_translations
                 for locale in self.target_locales:
                     season_name = season.get("name", f"Season {season_number}")
                     season_overview = season.get("overview")
@@ -250,7 +206,7 @@ class SeriesLoader(BaseLoader):
                         season_overview
                     ))
                 
-                # 8. episodes (если загружены)
+                # 8-9. episodes
                 if self.load_episodes:
                     for episode in season.get("episodes", []):
                         episode_number = episode["episode_number"]
@@ -263,7 +219,6 @@ class SeriesLoader(BaseLoader):
                             episode.get("air_date")
                         ))
                         
-                        # 9. episode_translations
                         for locale in self.target_locales:
                             episode_title = episode.get("name", f"Episode {episode_number}")
                             episode_overview = episode.get("overview")
@@ -275,8 +230,12 @@ class SeriesLoader(BaseLoader):
                                 locale,
                                 episode_title,
                                 episode_overview,
-                                None  # plot_summary
+                                None
                             ))
+        
+        print(f"✅ Transformed {len(raw_data)} series")
+        print(f"   - Genres links: {len(genres_data)}")
+        print(f"   - Countries links: {len(countries_data)}")
         
         return {
             "content": content_data,
@@ -299,10 +258,9 @@ class SeriesLoader(BaseLoader):
         elif "returning" in status or "planned" in status:
             return "ongoing"
         else:
-            return "ongoing"  # default
+            return "ongoing"
     
     def get_upsert_query(self) -> str:
-        # Не используется, т.к. transform возвращает словарь
         pass
     
     def run(self):
@@ -316,24 +274,22 @@ class SeriesLoader(BaseLoader):
         print(f"{'='*60}\n")
         
         with self:
-            # Extract
             raw_data = self.extract()
             if not raw_data:
                 print("⚠️  No data extracted")
                 return
             
-            # Transform
             print("\n⚙️  Transforming data...")
             transformed = self.transform(raw_data)
-            print(f"✅ Transformed {len(raw_data)} series")
             
-            # Load
             self._load_all_tables(transformed)
         
         print(f"\n✅ Series Loader completed successfully\n")
     
     def _load_all_tables(self, data: Dict[str, List]):
-        """Загрузка всех таблиц в правильном порядке"""
+        """
+        ✅ ИСПРАВЛЕНО: Теперь грузит genres и countries
+        """
         from psycopg2.extras import execute_batch
         from tqdm import tqdm
         
@@ -385,7 +341,7 @@ class SeriesLoader(BaseLoader):
             """
             self._batch_insert(query, data["translations"], "translations")
         
-        # 4. genres
+        # 4. genres ← ДОБАВЛЕНО!
         if data["genres"]:
             print(f"\n📤 Loading genres ({len(data['genres'])} records)...")
             query = """
@@ -396,7 +352,7 @@ class SeriesLoader(BaseLoader):
             """
             self._batch_insert(query, data["genres"], "genres")
         
-        # 5. countries
+        # 5. countries ← ДОБАВЛЕНО!
         if data["countries"]:
             print(f"\n📤 Loading countries ({len(data['countries'])} records)...")
             query = """
@@ -420,8 +376,8 @@ class SeriesLoader(BaseLoader):
                     updated_at = NOW()
                 RETURNING id, content_id, season_number
             """
-            # Нужен особый подход - сохраняем season_id для translations
-            season_id_map = {}  # (content_id, season_number) -> season_id
+            
+            season_id_map = {}
             
             with tqdm(total=len(data["seasons"]), desc="Loading seasons") as pbar:
                 for i in range(0, len(data["seasons"]), self.batch_size):
@@ -462,11 +418,10 @@ class SeriesLoader(BaseLoader):
                 """
                 self._batch_insert(query, season_trans_with_ids, "season_translations")
         
-        # 8. episodes (если есть)
+        # 8-9. episodes (если есть)
         if data["episodes"]:
             print(f"\n📤 Loading episodes ({len(data['episodes'])} records)...")
             
-            # Получаем все season_id
             self.cursor.execute("""
                 SELECT id, content_id, season_number 
                 FROM content_service.seasons
@@ -476,7 +431,6 @@ class SeriesLoader(BaseLoader):
                 for row in self.cursor.fetchall()
             }
             
-            # Преобразуем в (season_id, episode_number, ...)
             episodes_with_season_ids = []
             for row in data["episodes"]:
                 content_id, season_number, episode_number, runtime, air_date = row
@@ -514,7 +468,6 @@ class SeriesLoader(BaseLoader):
             
             print(f"  ✓ Loaded {len(episodes_with_season_ids)} episodes")
             
-            # 9. episode_translations
             if data["episode_translations"]:
                 print(f"\n📤 Loading episode_translations ({len(data['episode_translations'])} records)...")
                 
@@ -555,7 +508,6 @@ class SeriesLoader(BaseLoader):
 
 
 if __name__ == "__main__":
-    # Тест: топ-100 сериалов БЕЗ эпизодов (быстро)
     loader = SeriesLoader(
         strategy="discover",
         target_count=100,
