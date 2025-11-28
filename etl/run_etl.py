@@ -140,11 +140,11 @@ class ETLOrchestrator:
     ):
         """
         Этап 4: Загрузка персон.
-        
+    
         Args:
-            target_count: Количество персон
-            min_popularity: Минимальная популярность
-            load_from_content: Собирать персон из уже загруженного контента
+        target_count: Количество персон
+        min_popularity: Минимальная популярность
+        load_from_content: Собирать персон из уже загруженного контента
         """
         print("\n" + "="*70)
         print(f"STAGE 4: PERSONS")
@@ -152,15 +152,17 @@ class ETLOrchestrator:
         print(f"Min popularity: {min_popularity}")
         print(f"Load from content: {load_from_content}")
         print("="*70)
-        
+    
         return self.run_stage(
             "Persons",
             lambda: PersonLoader(
-                target_count=target_count,
-                min_popularity=min_popularity,
-                load_from_content=load_from_content
-            ).run()
-        )
+            target_count=target_count,
+            min_popularity=min_popularity,
+            load_from_content=load_from_content
+        ).run()
+    )
+
+    def run_series(
         self,
         strategy: str = "discover",
         target_count: int = 1000,
@@ -170,7 +172,7 @@ class ETLOrchestrator:
     ):
         """
         Этап 3: Загрузка сериалов.
-        
+    
         Args:
             strategy: "discover"
             target_count: Количество сериалов
@@ -184,12 +186,12 @@ class ETLOrchestrator:
         print(f"Min vote count: {min_vote_count}")
         print(f"Load episodes: {load_episodes}")
         print("="*70)
-        
+    
         if load_episodes:
             avg_seasons = 5
             estimated_minutes = (target_count * avg_seasons) / 45 / 60
             print(f"⏱️  Estimated time with episodes: ~{estimated_minutes:.1f} minutes")
-        
+    
         return self.run_stage(
             f"Series ({strategy})",
             lambda: SeriesLoader(
