@@ -234,6 +234,44 @@ class AsyncTMDBClient:
             # Фильтруем None (не найденные фильмы)
             return [r for r in results if r is not None]
 
+    
+    async def get_person_full_data(
+        self, 
+        session: aiohttp.ClientSession, 
+        person_id: int
+    ) -> Optional[Dict]:
+        """Получить полные данные персоны"""
+        return await self._request(
+            session,
+            f"/person/{person_id}",
+            params={
+                "language": "en",
+                "append_to_response": "translations,combined_credits"
+            }
+        )
+    
+    async def fetch_persons_batch(
+        self, 
+        person_ids: List[int],
+        progress_desc: str = "Fetching persons"
+    ) -> List[Dict]:
+        """
+        Загрузить батч персон параллельно.
+        
+        Использует 18 параллельных соединений и ~45 req/s.
+        """
+        
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            tasks = [
+                self.get_person_full_data(session, person_id) 
+                for person_id in person_ids
+            ]
+            
+            # Выполняем с прогресс-баром
+            results = await tqdm_asyncio.gather(*tasks, desc=progress_desc)
+            
+            # Фильтруем None (не найденные персоны)
+            return [r for r in results if r is not None]
 
 # ============================================================================
 # УТИЛИТЫ
